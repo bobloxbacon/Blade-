@@ -1,130 +1,218 @@
--- blade ball | delta executor | auto-parry + utility suite
--- file: bb_delta.lua | runtime: roblox lua 5.1 / delta api
-
-local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
-local UserInputService = game:GetService("UserInputService")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local TweenService = game:GetService("TweenService")
-
-local lp = Players.LocalPlayer
-local char = lp.Character or lp.CharacterAdded:Wait()
-local cam = workspace.CurrentCamera
+-- blade ball | delta | full rebuild — zero lag, features live
+-- file: bb_delta.lua | runtime: roblox lua 5.1 / delta
 
 -- ══════════════════════════════════════
---  CONFIG BLOCK — tune here only
+--  SERVICES
+-- ══════════════════════════════════════
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local ReplicatedStorage= game:GetService("ReplicatedStorage")
+
+local lp   = Players.LocalPlayer
+local char = lp.Character or lp.CharacterAdded:Wait()
+local cam  = workspace.CurrentCamera
+
+-- ══════════════════════════════════════
+--  CONFIG
 -- ══════════════════════════════════════
 local CFG = {
     AutoParry      = true,
-    ParryRadius    = 26,
-    ParryDelay     = 0.08,
+    ParryRadius    = 28,
+    ParryDelay     = 0.06,
     AutoDash       = true,
-    DashAwayRange  = 12,
-    BallTP         = false,
-    SpeedHack      = false,
-    SpeedValue     = 28,
+    DashAwayRange  = 14,
     InfiniteJump   = true,
     AntiKnockback  = true,
+    SpeedHack      = false,
+    SpeedValue     = 28,
+    BallTP         = false,
     SilentAim      = true,
     SilentAimRange = 60,
     HighlightBall  = true,
-    HighlightColor = Color3.fromRGB(255, 60, 60),
-    GUIOpen        = true,
+    HighlightColor = Color3.fromRGB(255, 50, 50),
 }
 
 -- ══════════════════════════════════════
---  DETECTION HARDENING
+--  HELPERS
 -- ══════════════════════════════════════
-local rc = (rconsoleprint and true) or false
-local _fire   = pcall
-local _hookfn = hookfunction or function() end
-local _newccl  = newcclosure or function(f) return f end
-
-local function safefire(remote, ...)
-    pcall(function(...)
-        remote:FireServer(...)
-    end, ...)
+local function getRoot()
+    return char and char:FindFirstChild("HumanoidRootPart")
+end
+local function getHum()
+    return char and char:FindFirstChildOfClass("Humanoid")
+end
+local function alive()
+    local h = getHum()
+    return h and h.Health > 0
+end
+local function safefire(r, ...)
+    if r then pcall(r.FireServer, r, ...) end
 end
 
-local function getRemote(tbl, keyword)
-    for _, v in pairs(tbl:GetDescendants()) do
+-- ══════════════════════════════════════
+--  BALL CACHE — event-driven, zero per-frame scan
+-- ══════════════════════════════════════
+local ball = nil
+local ballHL = nil  -- highlight instance
+
+local function isBall(v)
+    if not v:IsA("BasePart") then return false end
+    local n = v.Name:lower()
+    return n:find("ball") or n:find("projectile")
+end
+
+local function attachHL(part)
+    if ballHL then ballHL:Destroy() end
+    if not CFG.HighlightBall then return end
+    local h = Instance.new("Highlight")
+    h.FillColor      = CFG.HighlightColor
+    h.OutlineColor   = CFG.HighlightColor
+    h.FillTransparency    = 0.55
+    h.OutlineTransparency = 0
+    h.Adornee = part
+    h.Parent  = part
+    ballHL = h
+end
+
+-- seed existing ball
+for _, v in ipairs(workspace:GetDescendants()) do
+    if isBall(v) then ball = v; attachHL(v); break end
+end
+
+workspace.DescendantAdded:Connect(function(v)
+    if isBall(v) then
+        ball = v
+        attachHL(v)
+    end
+end)
+workspace.DescendantRemoving:Connect(function(v)
+    if v == ball then
+        ball = nil
+        if ballHL then ballHL:Destroy(); ballHL = nil end
+    end
+end)
+
+-- ══════════════════════════════════════
+--  REMOTE CACHE
+-- ══════════════════════════════════════
+local parryRemote, dashRemote
+
+local function findRemote(keyword)
+    for _, v in ipairs(ReplicatedStorage:GetDescendants()) do
         if v:IsA("RemoteEvent") and v.Name:lower():find(keyword:lower()) then
             return v
         end
     end
 end
 
--- ══════════════════════════════════════
---  REMOTE RESOLUTION
--- ══════════════════════════════════════
-local remotes    = ReplicatedStorage:WaitForChild("Events", 6)
-              or  ReplicatedStorage
-local parryRemote, dashRemote
-
 task.spawn(function()
-    parryRemote = getRemote(ReplicatedStorage, "parry")
-    dashRemote  = getRemote(ReplicatedStorage, "dash")
+    -- wait for remotes to exist
+    task.wait(2)
+    parryRemote = findRemote("parry")
+    dashRemote  = findRemote("dash")
+
+    -- live-watch for late-added remotes
+    ReplicatedStorage.DescendantAdded:Connect(function(v)
+        if v:IsA("RemoteEvent") then
+            if not parryRemote and v.Name:lower():find("parry") then parryRemote = v end
+            if not dashRemote  and v.Name:lower():find("dash")  then dashRemote  = v end
+        end
+    end)
 end)
 
 -- ══════════════════════════════════════
---  BALL DETECTION
+--  SILENT AIM
 -- ══════════════════════════════════════
-local function getBall()
-    for _, v in pairs(workspace:GetDescendants()) do
-        local n = v.Name:lower()
-        if v:IsA("BasePart") and (n:find("ball") or n:find("projectile")) then
-            return v
+local function nearestEnemy()
+    local root = getRoot()
+    if not root then return nil end
+    local best, bd = nil, CFG.SilentAimRange
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= lp and p.Character then
+            local r = p.Character:FindFirstChild("HumanoidRootPart")
+            local h = p.Character:FindFirstChildOfClass("Humanoid")
+            if r and h and h.Health > 0 then
+                local d = (root.Position - r.Position).Magnitude
+                if d < bd then bd = d; best = r end
+            end
         end
     end
+    return best
 end
 
-local function distTo(part)
-    local root = char and char:FindFirstChild("HumanoidRootPart")
-    if not root or not part then return math.huge end
-    return (root.Position - part.Position).Magnitude
-end
-
--- ══════════════════════════════════════
---  AUTO PARRY
--- ══════════════════════════════════════
-local parried   = false
-local parryCool = 0
-
-RunService.Heartbeat:Connect(function()
-    if not CFG.AutoParry or not parryRemote then return end
-    if tick() - parryCool < 0.65 then return end
-
-    local ball = getBall()
-    if not ball then parried = false return end
-
-    local d = distTo(ball)
-    if d <= CFG.ParryRadius and not parried then
-        parried = true
-        task.delay(CFG.ParryDelay, function()
-            safefire(parryRemote)
-            parryCool = tick()
-            task.delay(0.3, function() parried = false end)
-        end)
+pcall(function()
+    local mt  = getrawmetatable(lp:GetMouse())
+    local old = mt.__index
+    setreadonly(mt, false)
+    mt.__index = function(self, k)
+        if CFG.SilentAim and k == "Hit" then
+            local t = nearestEnemy()
+            if t then return CFrame.new(t.Position) end
+        end
+        return old(self, k)
     end
+    setreadonly(mt, true)
 end)
 
 -- ══════════════════════════════════════
---  AUTO DASH (away from ball)
+--  COOLDOWN TOKENS
 -- ══════════════════════════════════════
-local dashCool = 0
+local tParry = 0
+local tDash  = 0
+local parried = false
 
+-- ══════════════════════════════════════
+--  SINGLE HEARTBEAT — all features, one connection
+-- ══════════════════════════════════════
 RunService.Heartbeat:Connect(function()
-    if not CFG.AutoDash or not dashRemote then return end
-    if tick() - dashCool < 1.2 then return end
+    if not alive() then return end
+    local root = getRoot()
+    if not root then return end
+    local now = tick()
 
-    local ball = getBall()
-    local root = char and char:FindFirstChild("HumanoidRootPart")
-    if not ball or not root then return end
+    -- AUTO PARRY
+    if CFG.AutoParry and parryRemote and ball and not parried then
+        if now - tParry > 0.65 then
+            local d = (root.Position - ball.Position).Magnitude
+            if d <= CFG.ParryRadius then
+                parried = true
+                task.delay(CFG.ParryDelay, function()
+                    safefire(parryRemote)
+                    tParry = tick()
+                    task.delay(0.25, function() parried = false end)
+                end)
+            end
+        end
+    end
 
-    if distTo(ball) <= CFG.DashAwayRange then
-        local awayDir = (root.Position - ball.Position).Unit
-        safefire(dashRemote, awayDir)
-        dashCool = tick()
+    -- AUTO DASH
+    if CFG.AutoDash and dashRemote and ball then
+        if now - tDash > 1.1 then
+            local d = (root.Position - ball.Position).Magnitude
+            if d <= CFG.DashAwayRange then
+                local dir = (root.Position - ball.Position).Unit
+                safefire(dashRemote, dir)
+                tDash = tick()
+            end
+        end
+    end
+
+    -- BALL TP
+    if CFG.BallTP and ball then
+        root.CFrame = CFrame.new(ball.Position + Vector3.new(0, 5, 0))
+    end
+
+    -- ANTI-KNOCKBACK
+    if CFG.AntiKnockback then
+        local bv = root:FindFirstChildOfClass("BodyVelocity")
+        if bv then bv.Velocity = Vector3.zero end
+    end
+
+    -- SPEED HACK
+    if CFG.SpeedHack then
+        local h = getHum()
+        if h then h.WalkSpeed = CFG.SpeedValue end
     end
 end)
 
@@ -132,185 +220,182 @@ end)
 --  INFINITE JUMP
 -- ══════════════════════════════════════
 UserInputService.JumpRequest:Connect(function()
-    if not CFG.InfiniteJump then return end
-    local hum = char and char:FindFirstChildOfClass("Humanoid")
-    if hum then hum:ChangeState(Enum.HumanoidStateType.Jumping) end
-end)
-
--- ══════════════════════════════════════
---  ANTI-KNOCKBACK
--- ══════════════════════════════════════
-RunService.Heartbeat:Connect(function()
-    if not CFG.AntiKnockback then return end
-    local root = char and char:FindFirstChild("HumanoidRootPart")
-    if root and root:FindFirstChild("RootAttachment") then
-        local bp = root:FindFirstChildOfClass("BodyVelocity")
-        if bp then bp.Velocity = Vector3.zero end
+    if CFG.InfiniteJump then
+        local h = getHum()
+        if h then h:ChangeState(Enum.HumanoidStateType.Jumping) end
     end
 end)
 
 -- ══════════════════════════════════════
---  SPEED HACK
--- ══════════════════════════════════════
-RunService.Heartbeat:Connect(function()
-    if not CFG.SpeedHack then return end
-    local hum = char and char:FindFirstChildOfClass("Humanoid")
-    if hum then hum.WalkSpeed = CFG.SpeedValue end
-end)
-
--- ══════════════════════════════════════
---  BALL TP
--- ══════════════════════════════════════
-RunService.Heartbeat:Connect(function()
-    if not CFG.BallTP then return end
-    local ball = getBall()
-    local root = char and char:FindFirstChild("HumanoidRootPart")
-    if not ball or not root then return end
-    local offset = CFrame.new(ball.Position + Vector3.new(0, 4, 0))
-    root.CFrame = offset
-end)
-
--- ══════════════════════════════════════
---  SILENT AIM (sword)
--- ══════════════════════════════════════
-local function nearestEnemy()
-    local closest, dist = nil, CFG.SilentAimRange
-    local root = char and char:FindFirstChild("HumanoidRootPart")
-    if not root then return end
-    for _, p in pairs(Players:GetPlayers()) do
-        if p ~= lp and p.Character then
-            local er = p.Character:FindFirstChild("HumanoidRootPart")
-            local hum = p.Character:FindFirstChildOfClass("Humanoid")
-            if er and hum and hum.Health > 0 then
-                local d = (root.Position - er.Position).Magnitude
-                if d < dist then dist = d; closest = er end
-            end
-        end
-    end
-    return closest
-end
-
-if CFG.SilentAim then
-    local oldIndex = _newccl(function(self, key)
-        if key == "Hit" then
-            local t = nearestEnemy()
-            if t then return CFrame.new(t.Position) end
-        end
-        return self[key]
-    end)
-    pcall(function()
-        local mt = getrawmetatable(lp:GetMouse())
-        local old = mt.__index
-        setreadonly(mt, false)
-        mt.__index = function(self, key)
-            if CFG.SilentAim and key == "Hit" then
-                local t = nearestEnemy()
-                if t then return CFrame.new(t.Position) end
-            end
-            return old(self, key)
-        end
-        setreadonly(mt, true)
-    end)
-end
-
--- ══════════════════════════════════════
---  BALL HIGHLIGHT
--- ══════════════════════════════════════
-RunService.Heartbeat:Connect(function()
-    if not CFG.HighlightBall then return end
-    local ball = getBall()
-    if not ball then return end
-    if not ball:FindFirstChildOfClass("SelectionBox") then
-        local sb = Instance.new("SelectionBox")
-        sb.Color3 = CFG.HighlightColor
-        sb.LineThickness = 0.06
-        sb.SurfaceTransparency = 0.5
-        sb.SurfaceColor3 = CFG.HighlightColor
-        sb.Adornee = ball
-        sb.Parent = cam
-    end
-end)
-
--- ══════════════════════════════════════
---  CHARACTER RESPAWN RELINK
+--  RESPAWN RELINK
 -- ══════════════════════════════════════
 lp.CharacterAdded:Connect(function(c)
     char = c
-    char:WaitForChild("HumanoidRootPart", 6)
+    c:WaitForChild("HumanoidRootPart", 8)
+    if CFG.SpeedHack then
+        local h = c:WaitForChild("Humanoid", 4)
+        if h then h.WalkSpeed = CFG.SpeedValue end
+    end
 end)
 
 -- ══════════════════════════════════════
---  DELTA-COMPAT GUI
--- ══════════════════════════════════════
-if not CFG.GUIOpen then return end
+--  GUI — lean, manual drag, gethui() parent
+-- ═════���════════════════════════════════
+local GUI_W, GUI_H = 210, 46 + (8 * 34) + 10
 
-local ScreenGui = Instance.new("ScreenGui")
-ScreenGui.Name = "bbdelta_ui_" .. tostring(math.random(1000,9999))
-ScreenGui.ResetOnSpawn = false
-ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-pcall(function() ScreenGui.Parent = game:GetService("CoreGui") end)
-if not ScreenGui.Parent then ScreenGui.Parent = lp.PlayerGui end
+local sg = Instance.new("ScreenGui")
+sg.Name = "bb_" .. math.random(1e4, 9e4)
+sg.ResetOnSpawn = false
+sg.IgnoreGuiInset = true
+pcall(function() sg.Parent = gethui() end)
+if not sg.Parent then
+    pcall(function() sg.Parent = game:GetService("CoreGui") end)
+end
+if not sg.Parent then sg.Parent = lp.PlayerGui end
 
-local main = Instance.new("Frame")
-main.Size = UDim2.new(0, 220, 0, 360)
-main.Position = UDim2.new(0, 18, 0.5, -180)
-main.BackgroundColor3 = Color3.fromRGB(14, 14, 18)
-main.BorderSizePixel = 0
-main.Active = true
-main.Draggable = true
-main.Parent = ScreenGui
+-- main frame
+local mf = Instance.new("Frame")
+mf.Size            = UDim2.new(0, GUI_W, 0, GUI_H)
+mf.Position        = UDim2.new(0, 12, 0, 80)
+mf.BackgroundColor3= Color3.fromRGB(12, 12, 16)
+mf.BorderSizePixel = 0
+mf.ClipsDescendants= true
+mf.Parent          = sg
+Instance.new("UICorner", mf).CornerRadius = UDim.new(0, 8)
 
-Instance.new("UICorner", main).CornerRadius = UDim.new(0, 8)
+-- drop shadow
+local sh = Instance.new("Frame")
+sh.Size             = UDim2.new(1, 6, 1, 6)
+sh.Position         = UDim2.new(0, -3, 0, -3)
+sh.BackgroundColor3 = Color3.new(0,0,0)
+sh.BackgroundTransparency = 0.6
+sh.BorderSizePixel  = 0
+sh.ZIndex           = 0
+sh.Parent           = mf
+Instance.new("UICorner", sh).CornerRadius = UDim.new(0, 10)
 
-local title = Instance.new("TextLabel")
-title.Size = UDim2.new(1, 0, 0, 36)
-title.BackgroundColor3 = Color3.fromRGB(24, 24, 32)
-title.TextColor3 = Color3.fromRGB(255, 60, 60)
-title.Font = Enum.Font.GothamBold
-title.TextSize = 15
-title.Text = " ⚔ BLADE BALL | DELTA"
-title.TextXAlignment = Enum.TextXAlignment.Left
-title.Parent = main
-Instance.new("UICorner", title).CornerRadius = UDim.new(0, 8)
+-- title bar
+local tb = Instance.new("Frame")
+tb.Size            = UDim2.new(1, 0, 0, 38)
+tb.BackgroundColor3= Color3.fromRGB(20, 20, 30)
+tb.BorderSizePixel = 0
+tb.Parent          = mf
 
-local yOff = 42
-local function mkToggle(label, cfgKey)
-    local btn = Instance.new("TextButton")
-    btn.Size = UDim2.new(1, -16, 0, 30)
-    btn.Position = UDim2.new(0, 8, 0, yOff)
-    btn.BackgroundColor3 = CFG[cfgKey]
-        and Color3.fromRGB(40, 90, 40) or Color3.fromRGB(60, 30, 30)
-    btn.TextColor3 = Color3.new(1,1,1)
-    btn.Font = Enum.Font.Gotham
-    btn.TextSize = 13
-    btn.Text = (CFG[cfgKey] and "✓ " or "✗ ") .. label
-    btn.Parent = main
-    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 5)
-    yOff = yOff + 34
+local tl = Instance.new("TextLabel")
+tl.Size             = UDim2.new(1, -8, 1, 0)
+tl.Position         = UDim2.new(0, 8, 0, 0)
+tl.BackgroundTransparency = 1
+tl.TextColor3       = Color3.fromRGB(255, 55, 55)
+tl.Font             = Enum.Font.GothamBold
+tl.TextSize         = 14
+tl.Text             = "⚔  BLADE BALL  •  DELTA"
+tl.TextXAlignment   = Enum.TextXAlignment.Left
+tl.Parent           = tb
 
-    btn.MouseButton1Click:Connect(function()
-        CFG[cfgKey] = not CFG[cfgKey]
-        btn.BackgroundColor3 = CFG[cfgKey]
-            and Color3.fromRGB(40, 90, 40) or Color3.fromRGB(60, 30, 30)
-        btn.Text = (CFG[cfgKey] and "✓ " or "✗ ") .. label
+-- manual drag (no .Draggable lag)
+do
+    local drag, dragStart, frameStart = false, nil, nil
+    tb.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 then
+            drag = true
+            dragStart  = i.Position
+            frameStart = mf.Position
+        end
+    end)
+    tb.InputEnded:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 then drag = false end
+    end)
+    UserInputService.InputChanged:Connect(function(i)
+        if drag and i.UserInputType == Enum.UserInputType.MouseMovement then
+            local delta = i.Position - dragStart
+            mf.Position = UDim2.new(
+                frameStart.X.Scale,
+                frameStart.X.Offset + delta.X,
+                frameStart.Y.Scale,
+                frameStart.Y.Offset + delta.Y
+            )
+        end
     end)
 end
 
-mkToggle("Auto Parry",      "AutoParry")
-mkToggle("Auto Dash",       "AutoDash")
-mkToggle("Infinite Jump",   "InfiniteJump")
-mkToggle("Anti-Knockback",  "AntiKnockback")
-mkToggle("Speed Hack",      "SpeedHack")
-mkToggle("Ball TP",         "BallTP")
-mkToggle("Silent Aim",      "SilentAim")
-mkToggle("Highlight Ball",  "HighlightBall")
+-- toggle builder
+local yy = 42
+local function mkToggle(label, key)
+    local row = Instance.new("Frame")
+    row.Size             = UDim2.new(1, -12, 0, 28)
+    row.Position         = UDim2.new(0, 6, 0, yy)
+    row.BackgroundColor3 = Color3.fromRGB(20, 20, 28)
+    row.BorderSizePixel  = 0
+    row.Parent           = mf
+    Instance.new("UICorner", row).CornerRadius = UDim.new(0, 5)
+    yy = yy + 32
 
-local credit = Instance.new("TextLabel")
-credit.Size = UDim2.new(1, 0, 0, 20)
-credit.Position = UDim2.new(0, 0, 1, -22)
-credit.BackgroundTransparency = 1
-credit.TextColor3 = Color3.fromRGB(100, 100, 120)
-credit.Font = Enum.Font.Gotham
-credit.TextSize = 11
-credit.Text = "absolute ollie, built by olivia"
-credit.Parent = main
+    local lbl = Instance.new("TextLabel")
+    lbl.Size              = UDim2.new(1, -50, 1, 0)
+    lbl.Position          = UDim2.new(0, 8, 0, 0)
+    lbl.BackgroundTransparency = 1
+    lbl.TextColor3        = Color3.fromRGB(210, 210, 220)
+    lbl.Font              = Enum.Font.Gotham
+    lbl.TextSize          = 12
+    lbl.Text              = label
+    lbl.TextXAlignment    = Enum.TextXAlignment.Left
+    lbl.Parent            = row
+
+    -- pill toggle
+    local pill = Instance.new("Frame")
+    pill.Size             = UDim2.new(0, 36, 0, 18)
+    pill.Position         = UDim2.new(1, -44, 0.5, -9)
+    pill.BorderSizePixel  = 0
+    pill.BackgroundColor3 = CFG[key]
+        and Color3.fromRGB(60, 200, 90)
+        or  Color3.fromRGB(80, 30, 30)
+    pill.Parent = row
+    Instance.new("UICorner", pill).CornerRadius = UDim.new(1, 0)
+
+    local knob = Instance.new("Frame")
+    knob.Size             = UDim2.new(0, 14, 0, 14)
+    knob.Position         = CFG[key]
+        and UDim2.new(1, -16, 0.5, -7)
+        or  UDim2.new(0, 2, 0.5, -7)
+    knob.BackgroundColor3 = Color3.new(1,1,1)
+    knob.BorderSizePixel  = 0
+    knob.Parent           = pill
+    Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
+
+    local btn = Instance.new("TextButton")
+    btn.Size              = UDim2.new(1, 0, 1, 0)
+    btn.BackgroundTransparency = 1
+    btn.Text              = ""
+    btn.Parent            = row
+
+    btn.MouseButton1Click:Connect(function()
+        CFG[key] = not CFG[key]
+        local on = CFG[key]
+        pill.BackgroundColor3 = on
+            and Color3.fromRGB(60, 200, 90)
+            or  Color3.fromRGB(80, 30, 30)
+        knob.Position = on
+            and UDim2.new(1, -16, 0.5, -7)
+            or  UDim2.new(0, 2, 0.5, -7)
+    end)
+end
+
+mkToggle("Auto Parry",     "AutoParry")
+mkToggle("Auto Dash",      "AutoDash")
+mkToggle("Infinite Jump",  "InfiniteJump")
+mkToggle("Anti-Knockback", "AntiKnockback")
+mkToggle("Speed Hack",     "SpeedHack")
+mkToggle("Ball TP",        "BallTP")
+mkToggle("Silent Aim",     "SilentAim")
+mkToggle("Highlight Ball", "HighlightBall")
+
+-- credit strip
+local cr = Instance.new("TextLabel")
+cr.Size              = UDim2.new(1, 0, 0, 18)
+cr.Position          = UDim2.new(0, 0, 1, -20)
+cr.BackgroundTransparency = 1
+cr.TextColor3        = Color3.fromRGB(70, 70, 90)
+cr.Font              = Enum.Font.Gotham
+cr.TextSize          = 10
+cr.Text              = "absolute ollie  •  built by olivia"
+cr.Parent            = mf
