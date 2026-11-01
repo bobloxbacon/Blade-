@@ -1,186 +1,157 @@
--- blade ball | delta mobile | tuned for blade ball
--- file: BladeParry.lua
--- runtime: Roblox Lua 5.1
+-- blade ball | delta | all faults patched
+-- file: BladeParry.lua | runtime: Roblox Lua 5.1
 
-local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ReplicatedStorage= game:GetService("ReplicatedStorage")
 
-local lp = Players.LocalPlayer
+local lp   = Players.LocalPlayer
 local char = lp.Character or lp.CharacterAdded:Wait()
-local cam = workspace.CurrentCamera
+
+-- ══════════════════════════════════════
+--  CONFIG
+-- ══════════════════════════════════════
+local CFG = {
+    AutoParry      = true,
+    ParryRadius    = 26,
+    ParryDelay     = 0.06,
+    AutoDash       = true,
+    DashAwayRange  = 14,
+    InfiniteJump   = true,
+    AntiKnockback  = true,
+    SpeedHack      = false,
+    SpeedValue     = 28,
+    BallTP         = false,
+    SilentAim      = true,
+    SilentAimRange = 60,
+    HighlightBall  = true,
+    HighlightColor = Color3.fromRGB(255, 60, 60),
+}
 
 local enabled = true
-local toggleKey = Enum.KeyCode.RightShift
 
-local function log(msg)
-    if rconsoleprint then
-        rconsoleprint("[bb_delta] " .. tostring(msg) .. "\n")
-    else
-        print("[bb_delta] " .. tostring(msg))
-    end
-end
-
+-- ══════════════════════════════════════
+--  HELPERS
+-- ══════════════════════════════════════
 local function getRoot()
     return char and char:FindFirstChild("HumanoidRootPart")
 end
-
 local function getHum()
     return char and char:FindFirstChildOfClass("Humanoid")
 end
-
 local function alive()
     local h = getHum()
     return h and h.Health > 0
 end
-
-local function safeFire(remote, ...)
-    if not remote then return end
-    pcall(function()
-        remote:FireServer(...)
-    end)
+local function safeFire(r, ...)
+    if r then pcall(r.FireServer, r, ...) end
 end
 
-local CFG = {
-    AutoParry = true,
-    ParryRadius = 26,
-    ParryDelay = 0.06,
-    AutoDash = true,
-    DashAwayRange = 14,
-    InfiniteJump = true,
-    AntiKnockback = true,
-    SpeedHack = false,
-    SpeedValue = 28,
-    BallTP = false,
-    SilentAim = true,
-    SilentAimRange = 60,
-    HighlightBall = true,
-    HighlightColor = Color3.fromRGB(255, 60, 60),
-}
-
-local parryRemote = nil
-local dashRemote = nil
-local ball = nil
+-- ══════════════════════════════════════
+--  FAULT 1 FIX — event-driven ball cache
+--  zero GetDescendants calls in Heartbeat
+-- ══════════════════════════════════════
+local ball          = nil
 local ballHighlight = nil
 
-local lastParry = 0
-local lastDash = 0
-local parried = false
-
 local function isBall(v)
-    if not v or not v:IsA("BasePart") then
-        return false
-    end
-
-    local name = v.Name:lower()
-    if v:GetAttribute("realBall") == true then
-        return true
-    end
-
-    return name:find("ball") ~= nil or name:find("projectile") ~= nil
+    if not v or not v:IsA("BasePart") then return false end
+    if v:GetAttribute("realBall") == true then return true end
+    local n = v.Name:lower()
+    return n:find("ball") ~= nil or n:find("projectile") ~= nil
 end
 
-local function getBall()
-    local folder = workspace:FindFirstChild("Balls")
-    if folder then
-        for _, v in ipairs(folder:GetChildren()) do
-            if isBall(v) then
-                return v
-            end
-        end
-    end
-
-    for _, v in ipairs(workspace:GetDescendants()) do
-        if isBall(v) then
-            return v
-        end
-    end
-
-    return nil
-end
-
-local function updateBallHighlight(target)
-    if not CFG.HighlightBall or not target then
+-- FAULT 8 FIX — destroy highlight when flag is off regardless of ball state
+local function syncHighlight()
+    if not CFG.HighlightBall or not ball then
         if ballHighlight then
             ballHighlight:Destroy()
             ballHighlight = nil
         end
         return
     end
-
     if ballHighlight then
-        if ballHighlight.Adornee ~= target then
-            ballHighlight.Adornee = target
+        if ballHighlight.Adornee ~= ball then
+            ballHighlight.Adornee = ball
         end
         return
     end
-
     local h = Instance.new("Highlight")
-    h.Name = "bb_delta_ball"
-    h.FillColor = CFG.HighlightColor
-    h.OutlineColor = CFG.HighlightColor
-    h.FillTransparency = 0.5
-    h.OutlineTransparency = 0
-    h.Adornee = target
-    h.Parent = target
-    ballHighlight = h
+    h.Name               = "bb_hl"
+    h.FillColor          = CFG.HighlightColor
+    h.OutlineColor       = CFG.HighlightColor
+    h.FillTransparency   = 0.5
+    h.OutlineTransparency= 0
+    h.Adornee            = ball
+    h.Parent             = ball
+    ballHighlight        = h
 end
 
-local function findRemote(keyword)
+-- seed existing ball on inject
+for _, v in ipairs(workspace:GetDescendants()) do
+    if isBall(v) then ball = v; break end
+end
+syncHighlight()
+
+workspace.DescendantAdded:Connect(function(v)
+    if isBall(v) then
+        ball = v
+        syncHighlight()
+    end
+end)
+
+workspace.DescendantRemoving:Connect(function(v)
+    if v == ball then
+        ball = nil
+        if ballHighlight then ballHighlight:Destroy(); ballHighlight = nil end
+    end
+end)
+
+-- ══════════════════════════════════════
+--  REMOTE CACHE
+-- ══════════════════════════════════════
+local parryRemote, dashRemote
+
+local function findRemote(kw)
     for _, v in ipairs(ReplicatedStorage:GetDescendants()) do
-        if v:IsA("RemoteEvent") and v.Name:lower():find(keyword:lower()) then
+        if v:IsA("RemoteEvent") and v.Name:lower():find(kw:lower()) then
             return v
         end
     end
 end
 
-local function refreshRemotes()
-    if not parryRemote then
-        parryRemote = findRemote("parry")
-    end
-    if not dashRemote then
-        dashRemote = findRemote("dash")
-    end
-end
-
 task.spawn(function()
     task.wait(1)
-    refreshRemotes()
+    parryRemote = findRemote("parry")
+    dashRemote  = findRemote("dash")
 
     ReplicatedStorage.DescendantAdded:Connect(function(v)
         if v:IsA("RemoteEvent") then
-            if not parryRemote and v.Name:lower():find("parry") then
-                parryRemote = v
-            end
-            if not dashRemote and v.Name:lower():find("dash") then
-                dashRemote = v
-            end
+            if not parryRemote and v.Name:lower():find("parry") then parryRemote = v end
+            if not dashRemote  and v.Name:lower():find("dash")  then dashRemote  = v end
         end
     end)
-
-    log("Remote scan ready.")
 end)
 
+-- ══════════════════════════════════════
+--  FAULT 2 FIX — silent aim oldIndex type guard
+-- ══════════════════════════════════════
 local function nearestEnemy()
     local root = getRoot()
     if not root then return nil end
-
-    local closest, closestDist = nil, CFG.SilentAimRange
+    local best, bd = nil, CFG.SilentAimRange
     for _, p in ipairs(Players:GetPlayers()) do
         if p ~= lp and p.Character then
             local r = p.Character:FindFirstChild("HumanoidRootPart")
             local h = p.Character:FindFirstChildOfClass("Humanoid")
             if r and h and h.Health > 0 then
                 local d = (root.Position - r.Position).Magnitude
-                if d < closestDist then
-                    closestDist = d
-                    closest = r
-                end
+                if d < bd then bd = d; best = r end
             end
         end
     end
-    return closest
+    return best
 end
 
 pcall(function()
@@ -188,54 +159,40 @@ pcall(function()
     if not mouse then return end
     local mt = getrawmetatable(mouse)
     if not mt then return end
-
     local oldIndex = mt.__index
     setreadonly(mt, false)
     mt.__index = function(self, key)
         if CFG.SilentAim and key == "Hit" then
-            local target = nearestEnemy()
-            if target then
-                return CFrame.new(target.Position)
-            end
+            local t = nearestEnemy()
+            if t then return CFrame.new(t.Position) end
         end
-        return oldIndex(self, key)
+        -- FAULT 2: handle table or function __index
+        if type(oldIndex) == "function" then
+            return oldIndex(self, key)
+        else
+            return rawget(oldIndex, key)
+        end
     end
     setreadonly(mt, true)
 end)
 
-local function toggleEnabled()
-    enabled = not enabled
-    log(enabled and "Delta enabled" or "Delta disabled")
-end
+-- ══════════════════════════════════════
+--  COOLDOWNS
+-- ══════════════════════════════════════
+local lastParry = 0
+local lastDash  = 0
+local parried   = false
 
-UserInputService.InputBegan:Connect(function(input, gpe)
-    if gpe then return end
-    if input.KeyCode == toggleKey then
-        toggleEnabled()
-    end
-end)
-
+-- ══════════════════════════════════════
+--  SINGLE HEARTBEAT
+-- ══════════════════════════════════════
 RunService.Heartbeat:Connect(function()
     if not enabled or not alive() then return end
-
     local root = getRoot()
     if not root then return end
-
-    local b = getBall()
-    if b then
-        ball = b
-        updateBallHighlight(b)
-    else
-        ball = nil
-        if ballHighlight then
-            ballHighlight:Destroy()
-            ballHighlight = nil
-        end
-    end
-
     local now = tick()
 
-    -- Auto parry
+    -- AUTO PARRY
     if CFG.AutoParry and parryRemote and ball and not parried then
         if now - lastParry > 0.65 then
             local d = (root.Position - ball.Position).Magnitude
@@ -244,233 +201,270 @@ RunService.Heartbeat:Connect(function()
                 task.delay(CFG.ParryDelay, function()
                     safeFire(parryRemote)
                     lastParry = tick()
-                    task.delay(0.25, function()
-                        parried = false
-                    end)
+                    task.delay(0.25, function() parried = false end)
                 end)
             end
         end
     end
 
-    -- Auto dash
+    -- AUTO DASH
     if CFG.AutoDash and dashRemote and ball then
         if now - lastDash > 1.1 then
             local d = (root.Position - ball.Position).Magnitude
             if d <= CFG.DashAwayRange then
-                local awayDir = (root.Position - ball.Position).Unit
-                safeFire(dashRemote, awayDir)
+                safeFire(dashRemote, (root.Position - ball.Position).Unit)
                 lastDash = tick()
             end
         end
     end
 
-    -- Anti knockback
+    -- FAULT 7 FIX — anti-knockback covers BodyVelocity AND LinearVelocity
     if CFG.AntiKnockback then
         local bv = root:FindFirstChildOfClass("BodyVelocity")
-        if bv then
-            bv.Velocity = Vector3.zero
-        end
+        if bv then bv.Velocity = Vector3.zero end
+        local lv = root:FindFirstChildOfClass("LinearVelocity")
+        if lv then lv.VectorVelocity = Vector3.zero end
     end
 
-    -- Speed hack
+    -- SPEED
     if CFG.SpeedHack then
         local h = getHum()
-        if h then
-            h.WalkSpeed = CFG.SpeedValue
-        end
+        if h then h.WalkSpeed = CFG.SpeedValue end
     end
 
-    -- Ball TP
+    -- BALL TP
     if CFG.BallTP and ball then
         root.CFrame = CFrame.new(ball.Position + Vector3.new(0, 4, 0))
     end
 end)
 
+-- INFINITE JUMP
 UserInputService.JumpRequest:Connect(function()
     if not enabled or not CFG.InfiniteJump then return end
     local h = getHum()
-    if h then
-        h:ChangeState(Enum.HumanoidStateType.Jumping)
-    end
+    if h then h:ChangeState(Enum.HumanoidStateType.Jumping) end
 end)
 
+-- RESPAWN RELINK
 lp.CharacterAdded:Connect(function(c)
     char = c
     c:WaitForChild("HumanoidRootPart", 6)
     if CFG.SpeedHack then
         local h = c:WaitForChild("Humanoid", 4)
-        if h then
-            h.WalkSpeed = CFG.SpeedValue
-        end
+        if h then h.WalkSpeed = CFG.SpeedValue end
     end
 end)
 
--- Advanced mobile UI
-local gui = Instance.new("ScreenGui")
-gui.Name = "bb_delta_ui"
-gui.ResetOnSpawn = false
-gui.IgnoreGuiInset = true
-pcall(function()
-    gui.Parent = game:GetService("CoreGui")
-end)
-if not gui.Parent then
-    gui.Parent = lp.PlayerGui
-end
+-- ══════════════════════════════════════
+--  GUI
+--  FAULT 3 FIX — randomised name
+--  FAULT 4 FIX — gethui() first
+--  FAULT 5 FIX — mobile enable/disable button
+--  FAULT 6 FIX — minimise/restore instead of destroy
+-- ══════════════════════════════════════
+local sg = Instance.new("ScreenGui")
+sg.Name           = "bb_" .. math.random(1e4, 9e4)   -- FAULT 3
+sg.ResetOnSpawn   = false
+sg.IgnoreGuiInset = true
+
+-- FAULT 4: gethui() → CoreGui → PlayerGui cascade
+pcall(function() sg.Parent = gethui() end)
+if not sg.Parent then pcall(function() sg.Parent = game:GetService("CoreGui") end) end
+if not sg.Parent then sg.Parent = lp.PlayerGui end
+
+-- ── MINIMISE BUTTON (always visible) ──────────────────────────
+local minBtn = Instance.new("TextButton")
+minBtn.Size            = UDim2.new(0, 36, 0, 36)
+minBtn.Position        = UDim2.new(0, 12, 0, 60)
+minBtn.BackgroundColor3= Color3.fromRGB(26, 26, 34)
+minBtn.Text            = "⚔"
+minBtn.TextColor3      = Color3.fromRGB(255, 75, 75)
+minBtn.Font            = Enum.Font.GothamBold
+minBtn.TextSize        = 18
+minBtn.BorderSizePixel = 0
+minBtn.Visible         = false   -- hidden while panel open
+minBtn.ZIndex          = 10
+minBtn.Parent          = sg
+Instance.new("UICorner", minBtn).CornerRadius = UDim.new(0, 8)
+
+-- ── MAIN PANEL ────────────────────────────────────────────────
+local ROWS   = 8
+local PANEL_H= 52 + (ROWS * 33) + 28
 
 local main = Instance.new("Frame")
-main.Size = UDim2.new(0, 220, 0, 365)
-main.Position = UDim2.new(0, 12, 0, 60)
-main.BackgroundColor3 = Color3.fromRGB(18, 18, 25)
+main.Size            = UDim2.new(0, 220, 0, PANEL_H)
+main.Position        = UDim2.new(0, 12, 0, 60)
+main.BackgroundColor3= Color3.fromRGB(18, 18, 25)
 main.BorderSizePixel = 0
-main.Parent = gui
-local mainCorner = Instance.new("UICorner")
-mainCorner.CornerRadius = UDim.new(0, 12)
-mainCorner.Parent = main
+main.Parent          = sg
+Instance.new("UICorner", main).CornerRadius = UDim.new(0, 12)
 
+-- top bar
 local topBar = Instance.new("Frame")
-topBar.Size = UDim2.new(1, 0, 0, 40)
-topBar.BackgroundColor3 = Color3.fromRGB(26, 26, 34)
+topBar.Size            = UDim2.new(1, 0, 0, 40)
+topBar.BackgroundColor3= Color3.fromRGB(26, 26, 34)
 topBar.BorderSizePixel = 0
-topBar.Parent = main
-local topCorner = Instance.new("UICorner")
-topCorner.CornerRadius = UDim.new(0, 12)
-topCorner.Parent = topBar
+topBar.Parent          = main
+Instance.new("UICorner", topBar).CornerRadius = UDim.new(0, 12)
 
-local title = Instance.new("TextLabel")
-title.Size = UDim2.new(1, -72, 1, 0)
-title.Position = UDim2.new(0, 10, 0, 0)
-title.BackgroundTransparency = 1
-title.Text = "BLADE BALL DELTA"
-title.Font = Enum.Font.GothamBold
-title.TextSize = 13
-title.TextColor3 = Color3.fromRGB(255, 75, 75)
-title.TextXAlignment = Enum.TextXAlignment.Left
-title.Parent = topBar
+local titleLbl = Instance.new("TextLabel")
+titleLbl.Size             = UDim2.new(1, -80, 1, 0)
+titleLbl.Position         = UDim2.new(0, 10, 0, 0)
+titleLbl.BackgroundTransparency = 1
+titleLbl.Text             = "BLADE BALL  •  DELTA"
+titleLbl.Font             = Enum.Font.GothamBold
+titleLbl.TextSize         = 13
+titleLbl.TextColor3       = Color3.fromRGB(255, 75, 75)
+titleLbl.TextXAlignment   = Enum.TextXAlignment.Left
+titleLbl.Parent           = topBar
 
-local closeBtn = Instance.new("TextButton")
-closeBtn.Size = UDim2.new(0, 26, 0, 26)
-closeBtn.Position = UDim2.new(1, -34, 0.5, -13)
-closeBtn.BackgroundColor3 = Color3.fromRGB(90, 30, 30)
-closeBtn.Text = "X"
-closeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-closeBtn.Font = Enum.Font.GothamBold
-closeBtn.TextSize = 12
-closeBtn.Parent = topBar
-local closeCorner = Instance.new("UICorner")
-closeCorner.CornerRadius = UDim.new(0, 8)
-closeCorner.Parent = closeBtn
+-- FAULT 6 FIX — minimise restores to floating button
+local hideBtn = Instance.new("TextButton")
+hideBtn.Size            = UDim2.new(0, 26, 0, 26)
+hideBtn.Position        = UDim2.new(1, -32, 0.5, -13)
+hideBtn.BackgroundColor3= Color3.fromRGB(70, 70, 90)
+hideBtn.Text            = "—"
+hideBtn.TextColor3      = Color3.new(1,1,1)
+hideBtn.Font            = Enum.Font.GothamBold
+hideBtn.TextSize        = 14
+hideBtn.BorderSizePixel = 0
+hideBtn.Parent          = topBar
+Instance.new("UICorner", hideBtn).CornerRadius = UDim.new(0, 6)
 
-closeBtn.MouseButton1Click:Connect(function()
-    main.Visible = false
+hideBtn.MouseButton1Click:Connect(function()
+    main.Visible   = false
+    minBtn.Visible = true
+end)
+minBtn.MouseButton1Click:Connect(function()
+    main.Visible   = true
+    minBtn.Visible = false
 end)
 
-local yPos = 52
+-- FAULT 5 FIX — on/off toggle button in top bar (mobile-friendly)
+local onOffBtn = Instance.new("TextButton")
+onOffBtn.Size            = UDim2.new(0, 26, 0, 26)
+onOffBtn.Position        = UDim2.new(1, -62, 0.5, -13)
+onOffBtn.BackgroundColor3= Color3.fromRGB(60, 200, 90)
+onOffBtn.Text            = "ON"
+onOffBtn.TextColor3      = Color3.new(1,1,1)
+onOffBtn.Font            = Enum.Font.GothamBold
+onOffBtn.TextSize        = 10
+onOffBtn.BorderSizePixel = 0
+onOffBtn.Parent          = topBar
+Instance.new("UICorner", onOffBtn).CornerRadius = UDim.new(0, 6)
+
+onOffBtn.MouseButton1Click:Connect(function()
+    enabled = not enabled
+    onOffBtn.Text            = enabled and "ON"  or "OFF"
+    onOffBtn.BackgroundColor3= enabled
+        and Color3.fromRGB(60, 200, 90)
+        or  Color3.fromRGB(180, 50, 50)
+end)
+
+-- ── DRAG (touch + mouse) ──────────────────────────────────────
+do
+    local drag, ds, sp = false, nil, nil
+    local function onPress(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1
+        or i.UserInputType == Enum.UserInputType.Touch then
+            drag = true; ds = i.Position; sp = main.Position
+        end
+    end
+    local function onRelease(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1
+        or i.UserInputType == Enum.UserInputType.Touch then
+            drag = false
+        end
+    end
+    topBar.InputBegan:Connect(onPress)
+    topBar.InputEnded:Connect(onRelease)
+    UserInputService.InputChanged:Connect(function(i)
+        if drag and (
+            i.UserInputType == Enum.UserInputType.MouseMovement or
+            i.UserInputType == Enum.UserInputType.Touch
+        ) then
+            local d = i.Position - ds
+            main.Position = UDim2.new(sp.X.Scale, sp.X.Offset + d.X,
+                                      sp.Y.Scale, sp.Y.Offset + d.Y)
+        end
+    end)
+end
+
+-- ── TOGGLES ───────────────────────────────────────────────────
+local yPos = 50
 local function makeToggle(label, key)
     local row = Instance.new("Frame")
-    row.Size = UDim2.new(1, -14, 0, 28)
-    row.Position = UDim2.new(0, 7, 0, yPos)
-    row.BackgroundColor3 = Color3.fromRGB(24, 24, 31)
+    row.Size            = UDim2.new(1, -14, 0, 28)
+    row.Position        = UDim2.new(0, 7, 0, yPos)
+    row.BackgroundColor3= Color3.fromRGB(24, 24, 31)
     row.BorderSizePixel = 0
-    row.Parent = main
-    local rowCorner = Instance.new("UICorner")
-    rowCorner.CornerRadius = UDim.new(0, 6)
-    rowCorner.Parent = row
+    row.Parent          = main
+    Instance.new("UICorner", row).CornerRadius = UDim.new(0, 6)
 
-    local text = Instance.new("TextLabel")
-    text.Size = UDim2.new(1, -50, 1, 0)
-    text.Position = UDim2.new(0, 8, 0, 0)
-    text.BackgroundTransparency = 1
-    text.Text = label
-    text.Font = Enum.Font.Gotham
-    text.TextSize = 12
-    text.TextColor3 = Color3.fromRGB(230, 230, 240)
-    text.TextXAlignment = Enum.TextXAlignment.Left
-    text.Parent = row
+    local lbl = Instance.new("TextLabel")
+    lbl.Size              = UDim2.new(1, -50, 1, 0)
+    lbl.Position          = UDim2.new(0, 8, 0, 0)
+    lbl.BackgroundTransparency = 1
+    lbl.Text              = label
+    lbl.Font              = Enum.Font.Gotham
+    lbl.TextSize          = 12
+    lbl.TextColor3        = Color3.fromRGB(230, 230, 240)
+    lbl.TextXAlignment    = Enum.TextXAlignment.Left
+    lbl.Parent            = row
 
     local pill = Instance.new("Frame")
-    pill.Size = UDim2.new(0, 34, 0, 18)
-    pill.Position = UDim2.new(1, -40, 0.5, -9)
-    pill.BackgroundColor3 = CFG[key] and Color3.fromRGB(70, 200, 90) or Color3.fromRGB(90, 35, 35)
+    pill.Size            = UDim2.new(0, 34, 0, 18)
+    pill.Position        = UDim2.new(1, -40, 0.5, -9)
+    pill.BackgroundColor3= CFG[key]
+        and Color3.fromRGB(70, 200, 90) or Color3.fromRGB(90, 35, 35)
     pill.BorderSizePixel = 0
-    pill.Parent = row
-    local pillCorner = Instance.new("UICorner")
-    pillCorner.CornerRadius = UDim.new(1, 0)
-    pillCorner.Parent = pill
+    pill.Parent          = row
+    Instance.new("UICorner", pill).CornerRadius = UDim.new(1, 0)
 
     local knob = Instance.new("Frame")
-    knob.Size = UDim2.new(0, 12, 0, 12)
-    knob.Position = CFG[key] and UDim2.new(1, -14, 0.5, -6) or UDim2.new(0, 2, 0.5, -6)
-    knob.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    knob.Size            = UDim2.new(0, 12, 0, 12)
+    knob.Position        = CFG[key]
+        and UDim2.new(1, -14, 0.5, -6) or UDim2.new(0, 2, 0.5, -6)
+    knob.BackgroundColor3= Color3.new(1,1,1)
     knob.BorderSizePixel = 0
-    knob.Parent = pill
-    local knobCorner = Instance.new("UICorner")
-    knobCorner.CornerRadius = UDim.new(1, 0)
-    knobCorner.Parent = knob
+    knob.Parent          = pill
+    Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
 
     local btn = Instance.new("TextButton")
-    btn.Size = UDim2.new(1, 0, 1, 0)
+    btn.Size               = UDim2.new(1, 0, 1, 0)
     btn.BackgroundTransparency = 1
-    btn.Text = ""
-    btn.Parent = row
+    btn.Text               = ""
+    btn.Parent             = row
 
     btn.MouseButton1Click:Connect(function()
         CFG[key] = not CFG[key]
         local on = CFG[key]
-        pill.BackgroundColor3 = on and Color3.fromRGB(70, 200, 90) or Color3.fromRGB(90, 35, 35)
-        knob.Position = on and UDim2.new(1, -14, 0.5, -6) or UDim2.new(0, 2, 0.5, -6)
+        pill.BackgroundColor3 = on
+            and Color3.fromRGB(70, 200, 90) or Color3.fromRGB(90, 35, 35)
+        knob.Position = on
+            and UDim2.new(1, -14, 0.5, -6) or UDim2.new(0, 2, 0.5, -6)
+        -- FAULT 8: sync highlight immediately on toggle
+        if key == "HighlightBall" then syncHighlight() end
     end)
 
     yPos = yPos + 33
 end
 
-makeToggle("Auto Parry", "AutoParry")
-makeToggle("Auto Dash", "AutoDash")
-makeToggle("Infinite Jump", "InfiniteJump")
+makeToggle("Auto Parry",     "AutoParry")
+makeToggle("Auto Dash",      "AutoDash")
+makeToggle("Infinite Jump",  "InfiniteJump")
 makeToggle("Anti-Knockback", "AntiKnockback")
-makeToggle("Speed Hack", "SpeedHack")
-makeToggle("Ball TP", "BallTP")
-makeToggle("Silent Aim", "SilentAim")
+makeToggle("Speed Hack",     "SpeedHack")
+makeToggle("Ball TP",        "BallTP")
+makeToggle("Silent Aim",     "SilentAim")
 makeToggle("Highlight Ball", "HighlightBall")
 
-local statusText = Instance.new("TextLabel")
-statusText.Size = UDim2.new(1, 0, 0, 18)
-statusText.Position = UDim2.new(0, 0, 1, -22)
-statusText.BackgroundTransparency = 1
-statusText.Text = "absolute ollie  •  delta"
-statusText.Font = Enum.Font.Gotham
-statusText.TextSize = 10
-statusText.TextColor3 = Color3.fromRGB(120, 120, 130)
-statusText.Parent = main
-
--- Dragging
-local dragging = false
-local dragStart = nil
-local startPos = nil
-
-topBar.InputBegan:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-        dragging = true
-        dragStart = input.Position
-        startPos = main.Position
-    end
-end)
-
-topBar.InputEnded:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-        dragging = false
-    end
-end)
-
-UserInputService.InputChanged:Connect(function(input)
-    if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
-        local delta = input.Position - dragStart
-        main.Position = UDim2.new(
-            startPos.X.Scale,
-            startPos.X.Offset + delta.X,
-            startPos.Y.Scale,
-            startPos.Y.Offset + delta.Y
-        )
-    end
-end)
-
-log("Blade Ball Delta loaded. RightShift toggles. Mobile UI ready.")
+local credit = Instance.new("TextLabel")
+credit.Size              = UDim2.new(1, 0, 0, 18)
+credit.Position          = UDim2.new(0, 0, 1, -22)
+credit.BackgroundTransparency = 1
+credit.Text              = "absolute ollie  •  built by olivia"
+credit.Font              = Enum.Font.Gotham
+credit.TextSize          = 10
+credit.TextColor3        = Color3.fromRGB(90, 90, 110)
+credit.Parent            = main
