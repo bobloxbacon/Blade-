@@ -60,7 +60,7 @@ local CFG = {
 }
 
 local parryRemote = nil
-dashRemote = nil
+local dashRemote = nil
 local ball = nil
 local ballHighlight = nil
 
